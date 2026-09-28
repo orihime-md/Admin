@@ -51,6 +51,18 @@
   .toast.show{transform:none;opacity:1}
   .toast b{display:block;font-size:13px}.toast span{display:block;font-size:11px;color:var(--muted);margin-top:4px}
   .hidden{display:none !important}
+  /* --- Backend status --- */
+  .bstatus{display:inline-flex;align-items:center;gap:7px;cursor:pointer;background:transparent;color:var(--muted);font:inherit;font-size:11px;padding:6px 10px;border-radius:999px;border:1px solid var(--line)}
+  .bstatus .dot{width:8px;height:8px;border-radius:50%;background:var(--warn);box-shadow:0 0 0 0 transparent}
+  .bstatus.online{color:#a8ffd9;border-color:rgba(112,242,187,.3)}
+  .bstatus.online .dot{background:var(--good);box-shadow:0 0 8px var(--good)}
+  .bstatus.offline,.bstatus.wrong{color:#ffd0d8;border-color:rgba(255,122,141,.35)}
+  .bstatus.offline .dot,.bstatus.wrong .dot{background:var(--danger)}
+  .bstatus.checking .dot{animation:pulse 1s infinite}
+  @keyframes pulse{50%{opacity:.25}}
+  .topright{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+  .bnote{font-size:12px;color:var(--muted);margin:14px 0 0;line-height:1.5}
+  .bnote.bad{color:var(--danger)}
   /* --- Groups modal --- */
   body.modal-open{overflow:hidden}
   .modal{position:fixed;inset:0;z-index:50;background:rgba(4,4,12,.78);backdrop-filter:blur(6px);display:flex;align-items:flex-start;justify-content:center;padding:4vh 14px;overflow-y:auto}
@@ -89,7 +101,10 @@
 <main class="shell">
   <div class="topbar">
     <div class="brand"><div class="brand-badge">🛠</div><div><h1>Orihime MD</h1><small>Admin panel</small></div></div>
-    <a class="back" href="/">← Back to site</a>
+    <div class="topright">
+      <button type="button" class="bstatus checking" id="bStatus" title="Click to re-check the backend"><span class="dot"></span><span id="bStatusText">Checking backend…</span></button>
+      <a class="back" href="/">← Back to site</a>
+    </div>
   </div>
 
   <div id="lockScreen" class="center">
@@ -99,6 +114,7 @@
       <input type="password" id="passwordInput" placeholder="Password" autocomplete="current-password">
       <button class="btn primary" id="unlockBtn">Unlock</button>
       <div class="err" id="lockErr"></div>
+      <div class="bnote" id="lockBackendNote"></div>
     </div>
   </div>
 
@@ -166,6 +182,55 @@
   const $ = (id) => document.getElementById(id);
   const TOKEN_KEY = 'orihime_admin_token';
 
+  // ---- Where is the backend? ---------------------------------------------
+  // This page can be opened from two places:
+  //  * the Render service itself (same origin -> relative URLs work), or
+  //  * a static host such as GitHub Pages, which has NO /api routes — every
+  //    relative call would hit the host's 404 HTML page (that was the
+  //    "Unexpected token '<' ... is not valid JSON" error).
+  // So off-Render the calls go to the Render backend explicitly. You can also
+  // point it somewhere else once with  admin.html?api=https://your-backend
+  // (remembered in this browser; use ?api=reset to forget it).
+  const DEFAULT_BACKEND = 'https://orihime-md.onrender.com';
+  const API_KEY_STORE = 'orihime_api_base';
+  const API_BASE = (() => {
+    try {
+      const q = new URLSearchParams(location.search).get('api');
+      if (q === 'reset') localStorage.removeItem(API_KEY_STORE);
+      else if (q && /^https?:\/\//i.test(q)) localStorage.setItem(API_KEY_STORE, q.replace(/\/+$/, ''));
+      const saved = localStorage.getItem(API_KEY_STORE);
+      if (saved) return saved;
+    } catch {}
+    const h = location.hostname;
+    if (h.endsWith('.onrender.com') || h === 'localhost' || h === '127.0.0.1') return '';
+    return DEFAULT_BACKEND;
+  })();
+  const apiUrl = (path) => API_BASE + path;
+  const backendLabel = () => (API_BASE ? new URL(API_BASE).host : location.host);
+
+  // fetch() that always resolves to {res, data} or throws a readable Error.
+  async function backendFetch(path, opts = {}, timeoutMs = 60000){
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    let res;
+    try{
+      res = await fetch(apiUrl(path), { ...opts, signal: ctrl.signal });
+    }catch(e){
+      throw new Error(e.name === 'AbortError'
+        ? `The backend (${backendLabel()}) did not answer in time. It may be waking up — try again in a moment.`
+        : `Backend unreachable (${backendLabel()}). Check that it is running and that your connection works.`);
+    }finally{
+      clearTimeout(timer);
+    }
+    const text = await res.text();
+    let data = null;
+    try{ data = text ? JSON.parse(text) : {}; }catch{}
+    if (data === null) {
+      throw new Error(`${backendLabel()} did not return the Orihime API (HTTP ${res.status}). This page is probably not pointed at the backend — open it with ?api=https://your-backend-url`);
+    }
+    return { res, data };
+  }
+
   function toast(title, body){
     $('toastTitle').textContent = title;
     $('toastBody').textContent = body || '';
@@ -178,7 +243,7 @@
   function token(){ return sessionStorage.getItem(TOKEN_KEY) || ''; }
 
   async function api(path, opts = {}) {
-    const res = await fetch(path, {
+    const { res, data } = await backendFetch(path, {
       ...opts,
       headers: {
         'Content-Type': 'application/json',
@@ -186,8 +251,6 @@
         ...(opts.headers || {})
       }
     });
-    let data = {};
-    try { data = await res.json(); } catch {}
     if (res.status === 401) {
       sessionStorage.removeItem(TOKEN_KEY);
       showLock();
@@ -213,12 +276,11 @@
     $('lockErr').textContent = '';
     $('unlockBtn').disabled = true;
     try{
-      const res = await fetch('/api/admin/login', {
+      const { res, data } = await backendFetch('/api/admin/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ password })
       });
-      const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Login failed');
       sessionStorage.setItem(TOKEN_KEY, data.token);
       $('passwordInput').value = '';
@@ -629,6 +691,56 @@
       toast(await copyText(btn.dataset.link) ? 'Invite link copied' : 'Copy failed', '');
     }
   });
+
+  // ======================= Backend status =======================
+  const bs = { state: 'checking', busy: false };
+  function setBackend(state, text, note){
+    bs.state = state;
+    const el = $('bStatus');
+    el.className = 'bstatus ' + state;
+    el.title = `${backendLabel()} — click to re-check`;
+    $('bStatusText').textContent = text;
+    const n = $('lockBackendNote');
+    n.textContent = note || '';
+    n.className = 'bnote' + (state === 'offline' || state === 'wrong' ? ' bad' : '');
+  }
+  function fmtUptime(sec){
+    sec = Math.floor(Number(sec) || 0);
+    if (sec < 90) return sec + 's';
+    if (sec < 5400) return Math.round(sec / 60) + 'm';
+    return (sec / 3600).toFixed(1) + 'h';
+  }
+  async function checkBackend(){
+    if (bs.busy) return;
+    bs.busy = true;
+    if (bs.state !== 'online') setBackend('checking', 'Checking backend…', '');
+    const started = performance.now();
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 12000);
+    try{
+      const res = await fetch(apiUrl('/api/health'), { cache: 'no-store', signal: ctrl.signal });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data || data.ok !== true) {
+        setBackend('wrong', 'Wrong server', `${backendLabel()} is reachable but is not the Orihime backend (HTTP ${res.status}). Open this page with ?api=https://your-backend-url to point it at the right one.`);
+      } else {
+        const ms = Math.round(performance.now() - started);
+        setBackend('online', `Backend online · ${ms} ms`, `Connected to ${backendLabel()} · up ${fmtUptime(data.uptime)}`);
+      }
+    }catch(e){
+      if (e.name === 'AbortError') {
+        setBackend('offline', 'Backend not responding', `${backendLabel()} did not answer within 12 s. On Render's free plan it may be waking up from sleep — wait a minute, then tap the status badge to re-check.`);
+      } else {
+        setBackend('offline', 'Backend unreachable', `Cannot reach ${backendLabel()}. It may be down, redeploying, or blocked by your network. Tap the status badge to re-check.`);
+      }
+    }finally{
+      clearTimeout(timer);
+      bs.busy = false;
+    }
+  }
+  $('bStatus').addEventListener('click', checkBackend);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) checkBackend(); });
+  setInterval(() => { if (!document.hidden) checkBackend(); }, 15000);
+  checkBackend();
 
   if (token()) showDashboard(); else showLock();
 </script>
